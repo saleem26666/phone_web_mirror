@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Phone Web Mirror</title>
+  <style>
+    :root { --bg:#0b0f14; --bar:#151c27; --accent:#2f6fed; --ok:#3dd68c; --text:#e8eef7; --muted:#8b9bb4; }
+    * { box-sizing: border-box; }
+    html, body { margin:0; height:100%; background:var(--bg); color:var(--text); font-family:"Segoe UI",system-ui,sans-serif; }
+    .bar {
+      display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+      padding:10px 14px; background:var(--bar); border-bottom:1px solid rgba(255,255,255,.06);
+    }
+    .bar h1 { margin:0; font-size:1rem; font-weight:700; }
+    .status { color:var(--muted); font-size:.9rem; }
+    .status.on { color:var(--ok); }
+    button {
+      border:0; border-radius:10px; padding:8px 14px; font-weight:650; cursor:pointer;
+      background:var(--accent); color:#fff;
+    }
+    button.secondary { background:rgba(255,255,255,.08); }
+    button:disabled { opacity:.45; cursor:not-allowed; }
+    .stage {
+      position:relative; height:calc(100% - 52px); background:#000;
+      display:flex; align-items:center; justify-content:center; overflow:hidden;
+    }
+    #view {
+      max-width:100%; max-height:100%; width:auto; height:auto;
+      object-fit:contain; background:#000;
+    }
+    #canvas, #audioWork { display:none; }
+    .hint { position:absolute; bottom:12px; left:12px; right:12px; text-align:center;
+      color:var(--muted); font-size:.85rem; pointer-events:none; }
+  </style>
+</head>
+<body>
+  <div class="bar">
+    <h1>Phone Web Mirror</h1>
+    <span class="status" id="status">Connecting…</span>
+    <span style="flex:1"></span>
+    <button id="fsBtn" class="secondary">Fullscreen</button>
+    <button id="recBtn" disabled>Start recording</button>
+  </div>
+  <div class="stage" id="stage">
+    <img id="view" alt="phone screen" />
+    <canvas id="canvas"></canvas>
+    <div class="hint" id="hint">Waiting for phone stream… Keep the Phone Web Mirror app running on the device.</div>
+  </div>
+
+  <script>
+    const statusEl = document.getElementById('status');
+    const view = document.getElementById('view');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const hint = document.getElementById('hint');
+    const recBtn = document.getElementById('recBtn');
+    const fsBtn = document.getElementById('fsBtn');
+    const TYPE_VIDEO = 1, TYPE_AUDIO = 2;
+
+    let ws, recording = false, mediaRecorder = null, recordedChunks = [];
+    let audioCtx = null, audioDest = null, nextPlayTime = 0;
+    let lastObjectUrl = null;
+
+    function setStatus(text, on) {
+      statusEl.textContent = text;
+      statusEl.className = 'status' + (on ? ' on' : '');
+    }
+
+    function ensureAudio() {
+      if (audioCtx) return;
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 44100 });
+      audioDest = audioCtx.createMediaStreamDestination();
+      nextPlayTime = audioCtx.currentTime;
+    }
+
+    function playPcm(payload) {
+      try {
+        ensureAudio();
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+        const samples = payload.byteLength / 2;
+        const buf = audioCtx.createBuffer(1, samples, 44100);
+        const ch = buf.getChannelData(0);
+        const view16 = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+        for (let i = 0; i < samples; i++) {
+          ch[i] = view16.getInt16(i * 2, true) / 32768;
+        }
+        const src = audioCtx.createBufferSource();
+        src.buffer = buf;
+        src.connect(audioCtx.destination);
+        if (audioDest) src.connect(audioDest);
+        const startAt = Math.max(audioCtx.currentTime + 0.02, nextPlayTime);
+        src.start(startAt);
+        nextPlayTime = startAt + buf.duration;
+      } catch (_) {}
+    }
+
+    function drawFrame(bitmap) {
+      const w = bitmap.width, h = bitmap.height;
+      if (canvas.width !== w || canvas.height !== h) {
+        canvas.width = w; canvas.height = h;
+      }
+      ctx.drawImage(bitmap, 0, 0);
+      bitmap.close && bitmap.close();
+    }
+
+    async function onVideo(payload) {
+      hint.style.display = 'none';
+      recBtn.disabled = false;
+      const blob = new Blob([payload], { type: 'image/jpeg' });
+      if (lastObjectUrl) URL.revokeObjectURL(lastObjectUrl);
+      lastObjectUrl = URL.createObjectURL(blob);
+      view.src = lastObjectUrl;
+      try {
+        const bmp = await createImageBitmap(blob);
+        drawFrame(bmp);
+      } catch (_) {}
+    }
+
+    function connect() {
+      const url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/';
+      ws = new WebSocket(url);
+      ws.binaryType = 'arraybuffer';
+      ws.onopen = () => setStatus('Connected — live from phone/TV', true);
+      ws.onclose = () => {
+        setStatus('Disconnected — refreshing…', false);
+        setTimeout(connect, 1200);
+      };
+      ws.onerror = () => setStatus('Connection error — check WiFi / IP', false);
+      ws.onmessage = (ev) => {
+        const u8 = new Uint8Array(ev.data);
+        if (u8.length < 2) return;
+        const type = u8[0];
+        const payload = u8.subarray(1);
+        if (type === TYPE_VIDEO) onVideo(payload);
+        else if (type === TYPE_AUDIO) playPcm(payload);
+      };
+    }
+
+    function toggleRecord() {
+      if (recording) {
+        recording = false;
+        try { mediaRecorder && mediaRecorder.stop(); } catch (_) {}
+        recBtn.textContent = 'Start recording';
+        return;
+      }
+      ensureAudio();
+      const canvasStream = canvas.captureStream(12);
+      const tracks = [...canvasStream.getVideoTracks()];
+      if (audioDest) tracks.push(...audioDest.stream.getAudioTracks());
+      const mixed = new MediaStream(tracks);
+      recordedChunks = [];
+      try {
+        mediaRecorder = new MediaRecorder(mixed, { mimeType: 'video/webm;codecs=vp9,opus' });
+      } catch (_) {
+        try {
+          mediaRecorder = new MediaRecorder(mixed, { mimeType: 'video/webm' });
+        } catch (e) {
+          alert('Recording not supported in this browser: ' + e);
+          return;
+        }
+      }
+      mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size) recordedChunks.push(e.data); };
+      mediaRecorder.onstop = () => {
+        const blob = new Blob(recordedChunks, { type: 'video/webm' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'phone_mirror_' + Date.now() + '.webm';
+        a.click();
+        setStatus('Recording downloaded', true);
+      };
+      mediaRecorder.start(1000);
+      recording = true;
+      recBtn.textContent = 'Stop recording';
+      setStatus('Recording…', true);
+    }
+
+    function toggleFs() {
+      const el = document.getElementById('stage');
+      if (!document.fullscreenElement) el.requestFullscreen?.();
+      else document.exitFullscreen?.();
+    }
+
+    recBtn.onclick = toggleRecord;
+    fsBtn.onclick = toggleFs;
+    view.ondblclick = toggleFs;
+    connect();
+  </script>
+</body>
+</html>
